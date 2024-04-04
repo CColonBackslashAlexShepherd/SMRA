@@ -1,11 +1,17 @@
 from machine import Pin, ADC, UART ,PWM
+import _thread
 import time
 import ustruct
 import _thread
 import math
+import select
+import sys
 
 #emergency stop parameter to kill the program.
 E_STOP = False
+#Reference angle. Must be a global variable so it can be updated outside of the main function
+R = 90
+
 
 #Constants for ADC to angle conversion
 #min_adc and max_adc must be recalibrated whenever the potentiometer is adjusted
@@ -37,6 +43,13 @@ mot_enable = False
 # Configure the ADC pin
 pot = ADC(27)
 
+# Set up the poll object for serial communication
+poll_obj = select.poll()
+poll_obj.register(sys.stdin, select.POLLIN)
+
+ENABLE_CHAR = 'E'
+DISABLE_CHAR  = 'S'
+SET_ANGLE_CHAR = 'R'
 
 def read_ADC(DEBUG_MODE=False):
 #Takes: an optional debug mode parameter
@@ -111,6 +124,31 @@ def disable_stepper():
     mot_enable = False
     STEP.duty_u16(0) #0% duty cycle
 
+
+
+#function to handle serial communication, it will run in its own thread
+def serial_communication():
+    global R, E_STOP 
+    while E_STOP == False:
+        # Wait for input on stdin
+        poll_results = poll_obj.poll(0.5) # the '1' is how long it will wait for message before looping again (in microseconds)
+        if poll_results:
+            # Read the data from stdin (read data coming from PC)
+            data = sys.stdin.readline().strip()
+            
+            if data[0] == SET_ANGLE_CHAR:
+                R = int(data[1:])
+            elif data[0] == ENABLE_CHAR:
+                enable_stepper()
+            elif data[0] == DISABLE_CHAR:
+                disable_stepper()
+            elif data[0] == END_PROGRAM_CHAR:
+                E_STOP = True
+            else:
+                print("Invalid command: {} with value {}".format(data[0],data[1:]))
+        else:
+            # do something if no message received (like feed a watchdog timer)
+            continue
 def main():
 
     #PID parameters
@@ -118,56 +156,51 @@ def main():
     ki = 0
     kd = 0
 
-    #initial conditions
-    enable_stepper()
-    direct=1
-    control_stepper(1,0)
-    count = 0
-    t_max = 10
-
-    R = 90
-    integral = 0
+    control_stepper(1,0) #set the initial motor controller value to 0 speed, and an arbitrarily chosen direction.
     E_prev = 0
     t0 = time.time_ns()
     t_previous = 0
-
+    Ei = 0 #integral of the system angle
+    Ed = 0 #derivative of the system angle
     try:
         while E_STOP == False:
             
-            #if the program is told to go to a non logical angle
+            #if the program is told to go to a non logical angle, this will trigger the emergency stop
             if R < 0 or R > 180:
                 E_STOP = True
                 print("Quitting, Invalid Target Angle")
-            Y = read_ADC(DEBUG_MODE=False)
+            
+            #Get the current angle (Y variable in PID control system)
+            Y = read_ADC()
+            #Calculate error for control system
             E = R-Y
-            integral += E
 
             t_now = float(time.time_ns()-t0)*10**-9
-            U = E*kp + integral*ki + (E-E_prev)/(t_now-t_previous)*kd
+
+            #integral and derivative of error for integral and derivative control.
+
+            Ei += E
+
+            Ed = (E-E_prev)/(t_now-t_previous)
+
             t_previous = t_now
             E_prev = E
+
+            #calculate the input to the plant
+            #this takes the form of a frequency that can be negative or positive depending on the direction
+            U = E*kp + Ei*ki + Ed*kd
+            
+            
 
             f = abs(U)
             direction = (U>0)
             
+            #This provides the data ouptut for serial communication
             print("{} {} {} {} {}".format(t_now,Y,E,U,R))
             
             control_stepper(direction,round(f))
-            
-            if t_now >= t_max*1/2:
-                R = 135
-            elif t_now >= t_max/4:
-                R = 45
-            
-            if t_now >= t_max:
-                E_STOP = True
-            count += 1
             time.sleep(0.01)
-        
-            #if direct == 1:
-            #    direct =0
-            #else:
-            #    direct = 1
+
     except KeyboardInterrupt:
         print("program killed")
         disable_stepper()
@@ -176,3 +209,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    disable_stepper() #we call this one last time just to be extra safe
